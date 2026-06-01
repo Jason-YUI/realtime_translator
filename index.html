@@ -1,0 +1,428 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <title>AI 实时同传展示</title>
+    <style>
+      body {
+        background: #000;
+        color: #fff;
+        font-family: "PingFang SC", sans-serif;
+        margin: 0;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        min-height: 100vh;
+      }
+      .container {
+        width: 90%;
+        max-width: 900px;
+        padding: 20px 0 100px;
+      }
+      .log {
+        display: flex;
+        flex-direction: column;
+        gap: 16px;
+      }
+      .entry {
+        background: #111;
+        border-left: 4px solid #555;
+        border-radius: 8px;
+        padding: 14px 18px;
+        animation: fadein 0.3s ease;
+      }
+      .entry.latest {
+        border-left-color: #52c41a;
+      }
+      .entry .row-label {
+        font-size: 10px;
+        color: #555;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        margin-bottom: 2px;
+      }
+      .entry .cn {
+        font-size: 22px;
+        font-weight: 600;
+        color: #fff;
+        margin-bottom: 10px;
+      }
+      .entry .en {
+        font-size: 16px;
+        color: #ffd700;
+      }
+      .entry .vi {
+        font-size: 16px;
+        color: #7ec8e3;
+        margin-top: 4px;
+      }
+      .entry .en.pending,
+      .entry .vi.pending {
+        color: #555;
+      }
+      .entry .meta {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-top: 8px;
+      }
+      .entry .ts {
+        font-size: 11px;
+        color: #444;
+      }
+      .lang-badge {
+        font-size: 10px;
+        background: #222;
+        border: 1px solid #444;
+        color: #888;
+        border-radius: 4px;
+        padding: 1px 6px;
+      }
+      @keyframes fadein {
+        from {
+          opacity: 0;
+          transform: translateY(6px);
+        }
+        to {
+          opacity: 1;
+          transform: translateY(0);
+        }
+      }
+      .status {
+        position: fixed;
+        top: 20px;
+        right: 20px;
+        font-size: 12px;
+        color: #444;
+      }
+      .controls {
+        position: fixed;
+        bottom: 24px;
+        display: flex;
+        gap: 12px;
+        align-items: center;
+      }
+      .record-btn {
+        background: #ff4d4f;
+        border: none;
+        padding: 10px 24px;
+        color: white;
+        border-radius: 20px;
+        cursor: pointer;
+        font-size: 15px;
+      }
+      .clear-btn {
+        background: #333;
+        border: none;
+        padding: 10px 18px;
+        color: #aaa;
+        border-radius: 20px;
+        cursor: pointer;
+        font-size: 15px;
+      }
+      .vad-dot {
+        width: 10px;
+        height: 10px;
+        border-radius: 50%;
+        background: #555;
+        display: inline-block;
+        margin-left: 8px;
+        transition: background 0.15s;
+        vertical-align: middle;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="status" id="status">
+      <span id="statusText">WebSocket Disconnected</span>
+      <span class="vad-dot" id="vadDot"></span>
+    </div>
+    <div class="container">
+      <div class="log" id="log"></div>
+    </div>
+    <div class="controls">
+      <button class="record-btn" id="toggleBtn">开始录音</button>
+      <button class="clear-btn" id="clearBtn">清空</button>
+    </div>
+
+    <script>
+      const MAX_ENTRIES = Infinity; // show all translation records
+
+      function trimEntries() {
+        // Only count confirmed entries (with data-id), not the pending placeholder
+        const confirmed = [...log.querySelectorAll(".entry[data-id]")];
+        while (confirmed.length > MAX_ENTRIES) {
+          confirmed.shift().remove();
+        }
+      }
+
+      const ws = new WebSocket(`ws://${location.host}/ws`);
+      const log = document.getElementById("log");
+      const statusText = document.getElementById("statusText");
+      const vadDot = document.getElementById("vadDot");
+      const btn = document.getElementById("toggleBtn");
+      const clearBtn = document.getElementById("clearBtn");
+
+      let isRecording = false;
+      let stream = null;
+      let audioCtx = null;
+      let analyser = null;
+      let mediaRecorder = null;
+      let chunks = [];
+      let vadState = "idle"; // "idle" | "speaking"
+      let silenceTimer = null;
+      let maxDurTimer = null;
+      let pendingEntry = null; // 识别中… placeholder
+      let pendingTimer = null;
+
+      const SPEECH_THRESHOLD = 0.015; // RMS energy threshold
+      const SILENCE_MS = 1200; // silence duration (ms) that ends an utterance
+      const MAX_SPEECH_MS = 15000; // force-cut after 15s of continuous speech
+
+      ws.onopen = () => (statusText.textContent = "Connected");
+      ws.onclose = () => (statusText.textContent = "Disconnected");
+
+      ws.onmessage = (e) => {
+        try {
+          const data = JSON.parse(e.data);
+
+          if (data.type === "asr_partial") {
+            // Streaming segment — clear placeholder and show live text as it arrives
+            clearTimeout(pendingTimer);
+            pendingTimer = null;
+            if (pendingEntry && pendingEntry.parentNode) {
+              pendingEntry.remove();
+              pendingEntry = null;
+            }
+            let entry = document.querySelector(`.entry[data-id="${data.id}"]`);
+            if (!entry) {
+              document
+                .querySelectorAll(".entry.latest")
+                .forEach((el) => el.classList.remove("latest"));
+              entry = document.createElement("div");
+              entry.className = "entry latest";
+              entry.dataset.id = data.id;
+              const label = document.createElement("div");
+              label.className = "row-label";
+              label.textContent = "识别中…";
+              const cn = document.createElement("div");
+              cn.className = "cn";
+              entry.append(label, cn);
+              log.appendChild(entry);
+            }
+            entry.querySelector(".cn").textContent += data.text;
+            entry.scrollIntoView({ behavior: "smooth", block: "end" });
+            vadDot.style.background = "#ffa500";
+          } else if (data.type === "asr_cancel") {
+            // Server rejected this audio — remove the streaming entry from UI
+            const entry = document.querySelector(
+              `.entry[data-id="${data.id}"]`,
+            );
+            if (entry) entry.remove();
+            if (vadState === "idle") vadDot.style.background = "#555";
+          } else if (data.type === "asr") {
+            // Final confirmed ASR result
+            clearTimeout(pendingTimer);
+            pendingTimer = null;
+            if (pendingEntry && pendingEntry.parentNode) {
+              pendingEntry.remove();
+              pendingEntry = null;
+            }
+            if (vadState === "idle") vadDot.style.background = "#555";
+
+            // Reuse streaming entry (from asr_partial) if it exists, else create fresh
+            let entry = document.querySelector(`.entry[data-id="${data.id}"]`);
+            if (entry) {
+              // Upgrade streaming entry to confirmed state
+              const label = entry.querySelector(".row-label");
+              if (label) label.textContent = "ASR 识别";
+              entry.querySelector(".cn").textContent = data.original;
+            } else {
+              document
+                .querySelectorAll(".entry.latest")
+                .forEach((el) => el.classList.remove("latest"));
+              entry = document.createElement("div");
+              entry.className = "entry latest";
+              entry.dataset.id = data.id;
+              const aLabel = document.createElement("div");
+              aLabel.className = "row-label";
+              aLabel.textContent = "ASR 识别";
+              const cn = document.createElement("div");
+              cn.className = "cn";
+              cn.textContent = data.original;
+              entry.append(aLabel, cn);
+              log.appendChild(entry);
+            }
+
+            // Append translation placeholder and metadata
+            const tLabelEn = document.createElement("div");
+            tLabelEn.className = "row-label";
+            tLabelEn.textContent = "English";
+            const en = document.createElement("div");
+            en.className = "en pending";
+            en.textContent = "翻译中…";
+            const tLabelVi = document.createElement("div");
+            tLabelVi.className = "row-label";
+            tLabelVi.textContent = "Tiếng Việt";
+            const vi = document.createElement("div");
+            vi.className = "vi pending";
+            vi.textContent = "翻译中…";
+            const meta = document.createElement("div");
+            meta.className = "meta";
+            const ts = document.createElement("span");
+            ts.className = "ts";
+            ts.textContent = new Date().toLocaleTimeString();
+            const badge = document.createElement("span");
+            badge.className = "lang-badge";
+            badge.textContent = `${data.lang || "?"} ${data.lang_prob || 0}%`;
+            meta.append(ts, badge);
+            entry.append(tLabelEn, en, tLabelVi, vi, meta);
+            entry.scrollIntoView({ behavior: "smooth", block: "end" });
+            trimEntries();
+          } else if (data.type === "translation") {
+            // Translation arrived: update the matching entry
+            const entry = document.querySelector(
+              `.entry[data-id="${data.id}"]`,
+            );
+            if (entry) {
+              const en = entry.querySelector(".en");
+              if (en) {
+                en.textContent = data.en || data.translated || "";
+                en.classList.remove("pending");
+              }
+              const vi = entry.querySelector(".vi");
+              if (vi) {
+                vi.textContent = data.vi || "";
+                vi.classList.remove("pending");
+              }
+            }
+          }
+        } catch (err) {
+          console.error("ws.onmessage error:", err);
+        }
+      };
+
+      clearBtn.onclick = () => {
+        log.innerHTML = "";
+      };
+
+      // VAD loop: checks RMS energy every 50ms to detect speech start/end
+      function checkVAD() {
+        if (!isRecording) return;
+
+        const buf = new Float32Array(analyser.fftSize);
+        analyser.getFloatTimeDomainData(buf);
+        let sum = 0;
+        for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
+        const rms = Math.sqrt(sum / buf.length);
+
+        if (rms > SPEECH_THRESHOLD) {
+          // Energy above threshold — speech detected
+          clearTimeout(silenceTimer);
+          silenceTimer = null;
+
+          if (vadState === "idle") {
+            // Speech just started: begin recording this utterance
+            vadState = "speaking";
+            chunks = [];
+            mediaRecorder.start();
+            vadDot.style.background = "#ff4d4f";
+
+            // Safety: force-stop after MAX_SPEECH_MS
+            maxDurTimer = setTimeout(() => {
+              if (mediaRecorder.state === "recording") {
+                vadState = "idle";
+                vadDot.style.background = "#555";
+                mediaRecorder.stop();
+              }
+              maxDurTimer = null;
+            }, MAX_SPEECH_MS);
+          }
+        } else if (vadState === "speaking" && !silenceTimer) {
+          // Silence detected after speech — start countdown to end utterance
+          silenceTimer = setTimeout(() => {
+            silenceTimer = null;
+            clearTimeout(maxDurTimer);
+            maxDurTimer = null;
+            vadState = "idle";
+            vadDot.style.background = "#555";
+            if (mediaRecorder.state === "recording") mediaRecorder.stop();
+          }, SILENCE_MS);
+        }
+
+        setTimeout(checkVAD, 50);
+      }
+
+      btn.onclick = async () => {
+        if (!isRecording) {
+          stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+          audioCtx = new AudioContext();
+          analyser = audioCtx.createAnalyser();
+          analyser.fftSize = 512;
+          audioCtx.createMediaStreamSource(stream).connect(analyser);
+
+          mediaRecorder = new MediaRecorder(stream);
+          mediaRecorder.ondataavailable = (e) => {
+            if (e.data.size > 0) chunks.push(e.data);
+          };
+          mediaRecorder.onstop = () => {
+            if (chunks.length > 0 && ws.readyState === WebSocket.OPEN) {
+              const blob = new Blob(chunks, { type: mediaRecorder.mimeType });
+              blob.arrayBuffer().then((buf) => {
+                ws.send(buf);
+                // 立即显示「识别中…」占位，让用户知道系统在处理
+                clearTimeout(pendingTimer);
+                if (pendingEntry && pendingEntry.parentNode)
+                  pendingEntry.remove();
+                document
+                  .querySelectorAll(".entry.latest")
+                  .forEach((el) => el.classList.remove("latest"));
+                pendingEntry = document.createElement("div");
+                pendingEntry.className = "entry latest";
+                const pendingCn = document.createElement("div");
+                pendingCn.className = "cn";
+                pendingCn.style.cssText =
+                  "color:#666; font-style:italic; font-weight:400;";
+                pendingCn.textContent = "识别中…";
+                pendingEntry.appendChild(pendingCn);
+                log.appendChild(pendingEntry);
+                pendingEntry.scrollIntoView({
+                  behavior: "smooth",
+                  block: "end",
+                });
+                vadDot.style.background = "#ffa500"; // 橙色 = 分析中
+                // 15s timeout — remove placeholder if server filtered the audio silently
+                pendingTimer = setTimeout(() => {
+                  if (pendingEntry && pendingEntry.parentNode)
+                    pendingEntry.remove();
+                  pendingEntry = null;
+                  pendingTimer = null;
+                  if (vadState === "idle") vadDot.style.background = "#555";
+                }, 15000);
+              });
+            }
+            chunks = [];
+          };
+
+          isRecording = true;
+          btn.innerText = "停止录音";
+          btn.style.background = "#52c41a";
+          checkVAD();
+        } else {
+          isRecording = false;
+          vadState = "idle";
+          clearTimeout(silenceTimer);
+          clearTimeout(maxDurTimer);
+          vadDot.style.background = "#555";
+          if (mediaRecorder && mediaRecorder.state === "recording")
+            mediaRecorder.stop();
+          stream.getTracks().forEach((t) => t.stop());
+          audioCtx.close();
+          stream = null;
+          btn.innerText = "开始录音";
+          btn.style.background = "#ff4d4f";
+        }
+      };
+    </script>
+  </body>
+</html>
